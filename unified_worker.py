@@ -301,22 +301,52 @@ def process_single_poster(poster_id: str, badge_types: list, job_id: str) -> dic
             traceback.print_exc()
             raise v2_error
         
-        if result["success"]:
-            print(f"✅ Created enhanced poster with v2 processing: {result['output_path']}")
-            
-            # If badges were applied, upload to Jellyfin and add tag
-            if result["applied_badges"]:
-                # CRITICAL FIX: Use the ORIGINAL poster_id for Jellyfin upload, not the fallback poster's ID
-                # The poster_id from the workflow IS the Jellyfin ID we should upload to
-                upload_jellyfin_id = poster_id.replace('-', '')  # Remove dashes to match Jellyfin format
-                
-                print(f"Uploading enhanced poster to ORIGINAL Jellyfin ID: {upload_jellyfin_id} (not {jellyfin_id})")
-                
-                # Run Jellyfin upload via subprocess to avoid async conflicts
-                upload_result = run_jellyfin_upload_subprocess(
-                    upload_jellyfin_id,  # Use original poster ID, not fallback poster ID
-                    result["output_path"]
-                )
+if result["success"]:
+    print(f"✅ Created enhanced poster with v2 processing: {result['output_path']}")
+
+    if result["applied_badges"]:
+        # Prefer the real Jellyfin ID from metadata if available
+        upload_jellyfin_id = jellyfin_id if jellyfin_id else poster_id.replace('-', '')
+
+        # Helper to query children if this is a BoxSet
+        def get_collection_children(jellyfin_url, jellyfin_token, collection_id):
+            import requests
+            headers = {
+                'Authorization': f'MediaBrowser Token="{jellyfin_token}"',
+                'User-Agent': 'Aphrodite/2.0'
+            }
+            url = f"{jellyfin_url}/Items?ParentId={collection_id}&IncludeItemTypes=Movie&Recursive=true"
+            resp = requests.get(url, headers=headers, timeout=30)
+            if resp.status_code == 200:
+                data = resp.json()
+                return [item["Id"] for item in data.get("Items", [])]
+            else:
+                print(f"❌ Failed to query children for collection {collection_id}: {resp.status_code}")
+                return []
+
+        ids_to_upload = [upload_jellyfin_id]
+
+        # Detect BoxSet type and expand to children
+        if jellyfin_id and jellyfin_id.lower().startswith("boxset"):
+            children = get_collection_children(jellyfin_url, jellyfin_token, jellyfin_id)
+            if children:
+                ids_to_upload = children
+                print(f"📦 Collection detected, will upload/tag {len(children)} child items")
+
+        # Loop through all target IDs
+        for target_id in ids_to_upload:
+            upload_result = run_jellyfin_upload_subprocess(
+                target_id,
+                result["output_path"]
+            )
+            if upload_result["upload_success"]:
+                print(f"✅ Uploaded enhanced poster to Jellyfin item {target_id}")
+                if upload_result.get("tag_success"):
+                    print(f"✅ Added aphrodite-overlay tag to {target_id}")
+                else:
+                    print(f"❌ Failed to add tag to {target_id}: {upload_result.get('tag_error', 'Unknown error')}")
+            else:
+                print(f"❌ Upload failed for {target_id}: {upload_result.get('error', 'Unknown error')}")
                 
                 if upload_result["upload_success"]:
                     print(f"✅ Successfully uploaded enhanced poster to Jellyfin")
