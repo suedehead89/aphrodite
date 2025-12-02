@@ -301,61 +301,66 @@ def process_single_poster(poster_id: str, badge_types: list, job_id: str) -> dic
             traceback.print_exc()
             raise v2_error
         
-if result["success"]:
-    print(f"✅ Created enhanced poster with v2 processing: {result['output_path']}")
+        if result["success"]:
+            print(f"✅ Created enhanced poster with v2 processing: {result['output_path']}")
+            
+            # If badges were applied, upload to Jellyfin and add tag
+            if result["applied_badges"]:
+                # Prefer the real Jellyfin ID from metadata if available
+                upload_jellyfin_id = jellyfin_id if jellyfin_id else poster_id.replace('-', '')
+                print(f"Resolved upload target ID: {upload_jellyfin_id}")
 
-    if result["applied_badges"]:
-        # Prefer the real Jellyfin ID from metadata if available
-        upload_jellyfin_id = jellyfin_id if jellyfin_id else poster_id.replace('-', '')
+                # Try to get Jellyfin connection details
+                jellyfin_url, jellyfin_token = get_jellyfin_connection_details()
 
-        # Helper to query children if this is a BoxSet
-        def get_collection_children(jellyfin_url, jellyfin_token, collection_id):
-            import requests
-            headers = {
-                'Authorization': f'MediaBrowser Token="{jellyfin_token}"',
-                'User-Agent': 'Aphrodite/2.0'
-            }
-            url = f"{jellyfin_url}/Items?ParentId={collection_id}&IncludeItemTypes=Movie&Recursive=true"
-            resp = requests.get(url, headers=headers, timeout=30)
-            if resp.status_code == 200:
-                data = resp.json()
-                return [item["Id"] for item in data.get("Items", [])]
-            else:
-                print(f"❌ Failed to query children for collection {collection_id}: {resp.status_code}")
-                return []
+                ids_to_upload = [upload_jellyfin_id]
 
-        ids_to_upload = [upload_jellyfin_id]
+                # If we have connection details, detect if this is a BoxSet and expand to children
+                if jellyfin_url and jellyfin_token:
+                    import requests
+                    headers = {
+                        'Authorization': f'MediaBrowser Token="{jellyfin_token}"',
+                        'User-Agent': 'Aphrodite/2.0'
+                    }
 
-        # Detect BoxSet type and expand to children
-        if jellyfin_id and jellyfin_id.lower().startswith("boxset"):
-            children = get_collection_children(jellyfin_url, jellyfin_token, jellyfin_id)
-            if children:
-                ids_to_upload = children
-                print(f"📦 Collection detected, will upload/tag {len(children)} child items")
+                    # Fetch item metadata to check Type
+                    item_url = f"{jellyfin_url}/Items/{upload_jellyfin_id}"
+                    try:
+                        item_resp = requests.get(item_url, headers=headers, timeout=30)
+                        if item_resp.status_code == 200:
+                            item_data = item_resp.json()
+                            item_type = item_data.get("Type")
+                            print(f"Item {upload_jellyfin_id} Type: {item_type}")
 
-        # Loop through all target IDs
-        for target_id in ids_to_upload:
-            upload_result = run_jellyfin_upload_subprocess(
-                target_id,
-                result["output_path"]
-            )
-            if upload_result["upload_success"]:
-                print(f"✅ Uploaded enhanced poster to Jellyfin item {target_id}")
-                if upload_result.get("tag_success"):
-                    print(f"✅ Added aphrodite-overlay tag to {target_id}")
+                            if item_type == "BoxSet":
+                                # Expand to child movies
+                                children = get_collection_children(jellyfin_url, jellyfin_token, upload_jellyfin_id)
+                                if children:
+                                    ids_to_upload = children
+                                    print(f"📦 Collection detected; will upload/tag {len(children)} child items")
+                                else:
+                                    print("No children found for BoxSet; defaulting to collection ID")
+                        else:
+                            print(f"❌ Failed to get item metadata: HTTP {item_resp.status_code}")
+                    except Exception as e:
+                        print(f"❌ Error checking item type: {e}")
                 else:
-                    print(f"❌ Failed to add tag to {target_id}: {upload_result.get('tag_error', 'Unknown error')}")
-            else:
-                print(f"❌ Upload failed for {target_id}: {upload_result.get('error', 'Unknown error')}")
-                
-                if upload_result["upload_success"]:
-                    print(f"✅ Successfully uploaded enhanced poster to Jellyfin")
-                    if upload_result.get("tag_success"):
-                        print(f"✅ Successfully added aphrodite-overlay tag")
+                    print("⚠️ Jellyfin connection details missing; skipping BoxSet expansion")
+
+                # Loop through all target IDs and upload/tag each one
+                for target_id in ids_to_upload:
+                    upload_result = run_jellyfin_upload_subprocess(
+                        target_id,
+                        result["output_path"]
+                    )
+                    if upload_result["upload_success"]:
+                        print(f"✅ Uploaded enhanced poster to Jellyfin item {target_id}")
+                        if upload_result.get("tag_success"):
+                            print(f"✅ Added aphrodite-overlay tag to {target_id}")
+                        else:
+                            print(f"❌ Failed to add tag to {target_id}: {upload_result.get('tag_error', 'Unknown error')}")
                     else:
-                        print(f"❌ Failed to add aphrodite-overlay tag: {upload_result.get('tag_error', 'Unknown error')}")
-                else:
-                    print(f"❌ Failed to upload enhanced poster to Jellyfin: {upload_result.get('error', 'Unknown error')}")
+                        print(f"❌ Upload failed for {target_id}: {upload_result.get('error', 'Unknown error')}")
             
             return {
                 "success": True,
@@ -386,33 +391,21 @@ if result["success"]:
             }
 
 
-def download_jellyfin_poster(jellyfin_id: str) -> Optional[bytes]:
+def get_jellyfin_connection_details() -> (Optional[str], Optional[str]):
     """
-    Download poster data from Jellyfin - SYNC HTTP APPROACH WITH DB SETTINGS
+    Read Jellyfin URL and API key from the database (system_config), with settings.yaml fallback.
     """
-    import requests
     import psycopg2
-    import json
-    
+
+    jellyfin_url = None
+    jellyfin_token = None
+
     try:
-        print(f"Downloading poster from Jellyfin for ID: {jellyfin_id}")
-        
-        # Get Jellyfin connection details from database
         # Get database configuration from environment
         db_config = get_db_config()
         conn = psycopg2.connect(**db_config)
-        
-        jellyfin_url = None
-        jellyfin_token = None
-        
+
         with conn.cursor() as cursor:
-            # Debug: List all system config keys
-            cursor.execute("SELECT key, value FROM system_config")
-            all_configs = cursor.fetchall()
-            print(f"📋 All system_config entries:")
-            for key, value in all_configs:
-                print(f"   {key}: {str(value)[:100]}...")
-            
             # Get Jellyfin URL
             cursor.execute(
                 "SELECT value FROM system_config WHERE key = %s",
@@ -421,9 +414,9 @@ def download_jellyfin_poster(jellyfin_id: str) -> Optional[bytes]:
             url_result = cursor.fetchone()
             if url_result:
                 jellyfin_url = url_result[0]
-                print(f"🌐 Found Jellyfin URL: {jellyfin_url}")
-            
-            # Get Jellyfin API key  
+                print(f"🌐 Jellyfin URL from DB: {jellyfin_url}")
+
+            # Get Jellyfin API key
             cursor.execute(
                 "SELECT value FROM system_config WHERE key = %s",
                 ('jellyfin_api_key',)
@@ -431,9 +424,9 @@ def download_jellyfin_poster(jellyfin_id: str) -> Optional[bytes]:
             token_result = cursor.fetchone()
             if token_result:
                 jellyfin_token = token_result[0]
-                print(f"🔑 Found Jellyfin API key: {jellyfin_token[:10]}...")
-            
-            # Try to get from settings.yaml config file structure
+                print(f"🔑 Jellyfin API key from DB: {jellyfin_token[:10]}...")
+
+            # Fallback to settings.yaml nested structure
             if not jellyfin_url or not jellyfin_token:
                 cursor.execute(
                     "SELECT value FROM system_config WHERE key = %s",
@@ -443,19 +436,32 @@ def download_jellyfin_poster(jellyfin_id: str) -> Optional[bytes]:
                 if settings_result:
                     settings_data = settings_result[0]
                     if isinstance(settings_data, dict):
-                        # Navigate: settings.yaml -> api_keys -> Jellyfin -> [0] -> url/api_key
                         api_keys = settings_data.get('api_keys', {})
                         jellyfin_configs = api_keys.get('Jellyfin', [])
                         if jellyfin_configs and len(jellyfin_configs) > 0:
-                            jellyfin_config = jellyfin_configs[0]  # Take first Jellyfin config
-                            jellyfin_url = jellyfin_config.get('url')
-                            jellyfin_token = jellyfin_config.get('api_key')
-                            print(f"📄 Found in settings.yaml: URL={jellyfin_url}, Key={jellyfin_token[:10] if jellyfin_token else None}...")
+                            jellyfin_config = jellyfin_configs[0]
+                            jellyfin_url = jellyfin_config.get('url', jellyfin_url)
+                            jellyfin_token = jellyfin_config.get('api_key', jellyfin_token)
+                            print(f"📄 Jellyfin from settings.yaml: URL={jellyfin_url}, Key={jellyfin_token[:10] if jellyfin_token else None}...")
                         else:
-                            print(f"📄 No Jellyfin config found in api_keys structure")
-        
+                            print("📄 No Jellyfin config found in settings.yaml api_keys")
         conn.close()
+    except Exception as e:
+        print(f"Error reading Jellyfin connection details: {e}")
+
+    return jellyfin_url, jellyfin_token
+
+
+def download_jellyfin_poster(jellyfin_id: str) -> Optional[bytes]:
+    """
+    Download poster data from Jellyfin - SYNC HTTP APPROACH WITH DB SETTINGS
+    """
+    import requests
+    
+    try:
+        print(f"Downloading poster from Jellyfin for ID: {jellyfin_id}")
         
+        jellyfin_url, jellyfin_token = get_jellyfin_connection_details()
         if not jellyfin_url or not jellyfin_token:
             print(f"❌ Missing Jellyfin configuration in database")
             print(f"   URL: {'✅' if jellyfin_url else '❌'} Token: {'✅' if jellyfin_token else '❌'}")
@@ -488,14 +494,37 @@ def download_jellyfin_poster(jellyfin_id: str) -> Optional[bytes]:
         return None
 
 
+def get_collection_children(jellyfin_url: str, jellyfin_token: str, collection_id: str) -> list:
+    """
+    Query Jellyfin for all Movie children of a BoxSet (collection).
+    """
+    import requests
+    headers = {
+        'Authorization': f'MediaBrowser Token="{jellyfin_token}"',
+        'User-Agent': 'Aphrodite/2.0'
+    }
+    url = f"{jellyfin_url}/Items?ParentId={collection_id}&IncludeItemTypes=Movie&Recursive=true"
+    try:
+        resp = requests.get(url, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            child_ids = [item["Id"] for item in data.get("Items", [])]
+            print(f"Found {len(child_ids)} children for collection {collection_id}")
+            return child_ids
+        else:
+            print(f"❌ Failed to query children for collection {collection_id}: HTTP {resp.status_code}")
+            return []
+    except Exception as e:
+        print(f"❌ Error querying collection children: {e}")
+        return []
+
+
 def get_input_poster_path(poster_id: str) -> Optional[Path]:
     """
     Download FRESH poster for batch processing - ALWAYS DOWNLOAD NEW
     """
     from pathlib import Path
     import json
-    import tempfile
-    import subprocess
     from datetime import datetime
     
     print(f"🔄 FORCING FRESH DOWNLOAD for batch processing: {poster_id}")
